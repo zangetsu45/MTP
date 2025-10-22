@@ -15,10 +15,12 @@ def normalize_dataset(ds: Dataset, name: str = "") -> Dataset:
 
 
 def preprocess_and_save(
-    dataset_name: str = "wikitext",
-    dataset_config: str = "wikitext-103-v1",
+    # --- UPDATED DEFAULTS ---
+    dataset_name: str = "openwebtext",
+    dataset_config: str | None = None,
     dataset_split: str = "train",
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str = "NousResearch/Llama-2-7b-chat-hf",
+    # --- END UPDATED DEFAULTS ---
     output_dir: str = "data/processed",
     block_size: int = 1024,
     sample_size: int | None = None,
@@ -41,26 +43,28 @@ def preprocess_and_save(
         print(f"Downsampled to {sample_size} examples.")
 
     # 2) Normalize / clean
-    dataset = normalize_dataset(dataset, name=f"{dataset_name}:{dataset_config}")
+    dataset = normalize_dataset(dataset, name=f"{dataset_name}:{dataset_config or ''}")
 
     # 3) Load tokenizer
     print(f"Loading tokenizer: {tokenizer_name}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
+    # --- THIS LOGIC IS ALREADY PERFECT FOR LLAMA ---
     # Ensure PAD exists (Llama/Mistral often have no pad)
     if tokenizer.pad_token is None:
+        print("Tokenizer has no pad_token; setting pad_token = eos_token")
         tokenizer.pad_token = tokenizer.eos_token
     # Use right-padding for causal LM batches
     try:
         tokenizer.padding_side = "right"
     except Exception:
         pass
+    # --- END LLAMA-COMPATIBLE LOGIC ---
 
     eos_id = tokenizer.eos_token_id
 
     # 4) Tokenize
-    # For packing: tokenize WITHOUT padding/truncation; later we concat & chunk to block_size
-    # For fixed-length: tokenize WITH truncation/padding to block_size (and optionally force EOS at end)
+    # This logic is model-agnostic and correct for both packing/not-packing
     def tokenize_fn(examples):
         if pack:
             enc = tokenizer(
@@ -77,7 +81,7 @@ def preprocess_and_save(
                 padding="max_length",
                 max_length=block_size,
             )
-            # Optionally ensure EOS ends the sequence (helpful for GPT-2 style)
+            # Optionally ensure EOS ends the sequence
             if eos_id is not None:
                 for ids in enc["input_ids"]:
                     if ids[-1] != eos_id:
@@ -93,7 +97,7 @@ def preprocess_and_save(
         desc="Tokenizing",
     )
 
-    # 5) Pack or keep fixed-length
+    # 5) Pack or keep fixed-length (This logic is also model-agnostic and correct)
     if pack:
         # Optionally append EOS between documents so boundaries are explicit
         def pack_fn(examples):
@@ -150,13 +154,18 @@ def preprocess_and_save(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess datasets for MEDUSA (self-distill friendly)")
 
-    # Dataset selection
-    parser.add_argument("--dataset_name", type=str, default="wikitext")
-    parser.add_argument("--dataset_config", type=str, default="wikitext-103-v1")
+    # --- UPDATED DEFAULTS ---
+    # Dataset selection (changed to a more modern, larger dataset)
+    parser.add_argument("--dataset_name", type=str, default="openwebtext")
+    parser.add_argument("--dataset_config", type=str, default=None) # openwebtext has no config
     parser.add_argument("--dataset_split", type=str, default="train")
 
-    # Tokenizer / IO
-    parser.add_argument("--tokenizer", type=str, default="gpt2", help="HF tokenizer/model name")
+    # Tokenizer / IO (changed to a Llama-based tokenizer)
+    # IMPORTANT: This MUST match the model you use in your trainer!
+    parser.add_argument("--tokenizer", type=str, default="NousResearch/Llama-2-7b-chat-hf",
+                        help="HF tokenizer/model name (must match your student model)")
+    # --- END UPDATED DEFAULTS ---
+    
     parser.add_argument("--output_dir", type=str, default="data/processed", help="Where to save processed data")
 
     # Sequence shaping

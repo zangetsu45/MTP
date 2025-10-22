@@ -1,9 +1,10 @@
 import os, json, torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
 
+# (This part is unchanged)
 # -----------------------
 # MEDUSA head: SiLU -> +residual -> vocab
 #   p_t^(k) = softmax(W2^(k) * ( SiLU(W1^(k) * h_t) + h_t ))
@@ -70,23 +71,42 @@ class MultiTokenHead(nn.Module):
             out[off] = logits
         return out
 
-
-class GPT2MTPStudent(nn.Module):
+# -----------------------
+# UPDATED MODEL CLASS
+# -----------------------
+class MedusaLlamaStudent(nn.Module):
     def __init__(
         self,
-        model_name="gpt2",
+        # Default changed to a Llama-based model
+        model_name="NousResearch/Llama-2-7b-chat-hf",
         offsets=(1, 2),
-        device=None,
         lora=True,
+        qlora=True,          # <-- NEW: Flag to enable QLoRA
         lora_r=8,
         lora_alpha=16,
         lora_dropout=0.05,
-        lora_targets=("c_attn","c_proj"),
+        # Default targets changed for Llama
+        lora_targets=("q_proj", "v_proj"),
     ):
         super().__init__()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
-        self.backbone = AutoModelForCausalLM.from_pretrained(model_name)
+        
+        # --- QLoRA Setup ---
+        quantization_config = None
+        if qlora:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        self.backbone = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            device_map="auto"  # Required for QLoRA
+        )
+        # --- End QLoRA Setup ---
 
         if lora:
             cfg = LoraConfig(
@@ -102,29 +122,40 @@ class GPT2MTPStudent(nn.Module):
         self.config = self.backbone.config
         d_model = self.config.hidden_size
         vocab_size = self.config.vocab_size
+        
+        # Get device from backbone (which is set by device_map)
+        self.device = self.backbone.device
 
         # IMPORTANT: pass the LM head so MEDUSA heads can copy W2 from it
-        self.mtp_head = MultiTokenHead(d_model, vocab_size, offsets, lm_head=self.backbone.lm_head)
+        self.mtp_head = MultiTokenHead(
+            d_model, vocab_size, offsets, lm_head=self.backbone.lm_head
+        )
+        # Move the new head to the same device as the backbone
+        self.mtp_head.to(self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.to(self.device)
+            
+        # No need for self.to(self.device) at the end, device_map handled it
 
     def forward(self, input_ids, attention_mask=None):
-        # Ask the CausalLM model for hidden states
-        outputs = self.backbone.transformer(
+        # --- UPDATED FOR LLAMA ---
+        # Llama uses .model, GPT-2 uses .transformer
+        outputs = self.backbone.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True
         )
+        # --- END UPDATE ---
+
         hidden_states = outputs.last_hidden_state            # [B, S, D]
         lm_logits = self.backbone.lm_head(hidden_states)     # [B, S, V]
 
         # MEDUSA heads (residual + SiLU) over the same hidden states
         mtp_logits_full = self.mtp_head(hidden_states, last_only=False)
         mtp_logits_last = {k: v[:, -1, :] for k, v in mtp_logits_full.items()}
+        
         return {
             "lm_logits": lm_logits,
             "mtp_logits_full": mtp_logits_full,
@@ -133,13 +164,22 @@ class GPT2MTPStudent(nn.Module):
 
     def save_pretrained(self, save_directory):
         os.makedirs(save_directory, exist_ok=True)
+        # PEFT model's save_pretrained saves the adapter config
         if hasattr(self.backbone, "save_pretrained"):
             self.backbone.save_pretrained(save_directory)
         else:
+            # Fallback for non-PEFT model
             torch.save(self.backbone.state_dict(), os.path.join(save_directory, "backbone.bin"))
+        
+        # Save the custom Medusa head
         torch.save(self.mtp_head.state_dict(), os.path.join(save_directory, "mtp_head.pt"))
+        
+        # Save metadata to reconstruct the class
         with open(os.path.join(save_directory, "mtp_meta.json"), "w") as f:
             json.dump(
-                {"model_name": self.model_name, "offsets": list(self.mtp_head.offsets)},
+                {
+                    "model_name": self.model_name, 
+                    "offsets": list(self.mtp_head.offsets)
+                },
                 f
             )

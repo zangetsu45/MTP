@@ -53,12 +53,7 @@ def sample_topk(logits, k=0, temperature=1.0):
 def parallel_decode(student, tokenizer, prompt, max_new_tokens=32, 
                    draft_top_k=0, draft_temperature=1.0, 
                    verify_top_k=1, verbose=False):
-    """
-    True parallel speculative decoding:
-    - Draft 2 tokens from MTP heads based on current state
-    - Verify BOTH in a single backbone forward pass
-    - Accept longest valid prefix
-    """
+    
     device = next(student.parameters()).device
     enc = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids = enc["input_ids"]
@@ -73,7 +68,7 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
     
     # Ensure last_h is 3D [B, S, D]
     if last_h.dim() == 4:
-        last_h = last_h.squeeze(1)  # Remove extra dimension
+        last_h = last_h.squeeze(1)
     
     eos = tokenizer.eos_token_id
     gen = []
@@ -86,14 +81,14 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
         'total_tokens': 0
     }
     
-    num_iterations = (max_new_tokens + 1) // 2  # Generate up to 2 tokens per iteration
+    num_iterations = (max_new_tokens + 1) // 2
     
     for step in range(num_iterations):
         # Ensure last_h is always 3D [B, S, D]
         if last_h.dim() == 4:
             last_h = last_h.squeeze(1)
         
-        # Draft BOTH tokens from current state (parallel drafting)
+        # Draft BOTH tokens from current state
         mtp = student.mtp_head(last_h, last_only=True)
         log1 = mtp[1][:, -1, :]
         log2 = mtp[2][:, -1, :]
@@ -103,6 +98,9 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
         
         # Create candidate sequence [prop1, prop2]
         candidates = torch.cat([prop1.unsqueeze(0), prop2.unsqueeze(0)], dim=1)  # [1, 2]
+        
+        # ⭐ SAVE the past BEFORE verification
+        past_before_verify = past
         
         # SINGLE backbone forward pass for BOTH tokens (parallel verification)
         out = student.backbone(input_ids=candidates, 
@@ -129,7 +127,7 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
         
         # Accept longest valid prefix
         if ok1 and ok2:
-            # Both tokens accepted
+            # Both tokens accepted - use the state from verification
             gen.extend([prop1.item(), prop2.item()])
             stats['both_accepted'] += 1
             stats['total_tokens'] += 2
@@ -150,10 +148,9 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
             gen.append(prop1.item())
             stats['first_only'] += 1
             stats['total_tokens'] += 1
-            # Need to extract state after first token only
-            # Run forward pass with just prop1 to get correct state
+            # ⭐ Use past_before_verify and add just the accepted token
             out_single = student.backbone(input_ids=prop1.unsqueeze(0).unsqueeze(0),
-                                         past_key_values=past,
+                                         past_key_values=past_before_verify,
                                          use_cache=True,
                                          output_hidden_states=True,
                                          return_dict=True)
@@ -175,9 +172,9 @@ def parallel_decode(student, tokenizer, prompt, max_new_tokens=32,
             gen.append(tok.item())
             stats['both_rejected'] += 1
             stats['total_tokens'] += 1
-            # Extract state after corrected first token
+            # ⭐ Use past_before_verify and add the corrected token
             out_single = student.backbone(input_ids=tok.unsqueeze(0).unsqueeze(0),
-                                         past_key_values=past,
+                                         past_key_values=past_before_verify,
                                          use_cache=True,
                                          output_hidden_states=True,
                                          return_dict=True)
@@ -245,4 +242,4 @@ def main():
         pass
 
 if __name__ == "__main__":
-    main()
+    main()@torch.no_grad()

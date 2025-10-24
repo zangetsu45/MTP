@@ -25,7 +25,7 @@ def main():
     # p.add_argument("--teacher_name", ...) # <-- REMOVED
     p.add_argument("--tokenizer_name", type=str, default=None,
                        help="Defaults to student_name")
-    p.add_argument("--offsets", type=int, nargs="*", default=[1, 2, 3])
+    p.add_argument("--offsets", type=int, nargs="*", default=[2, 3, 4, 5])  # Predict tokens at offsets t+2, t+3, t+4, t+5
 
     # --- QLoRA / LoRA Config ---
     p.add_argument('--qlora', action=argparse.BooleanOptionalAction, default=True,

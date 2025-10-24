@@ -41,11 +41,12 @@ class MedusaTrainer:
         lambda0_warmup=False,       # if True: gradually increase λ0 after warmup
         save_dir="experiments/logs/run_medusa",
         ckpt_root="checkpoints",
-        tokenizer=None
+        tokenizer=None,
     ):
         self.model = model
         # self.teacher = teacher    # <-- REMOVED
         self.temperature = temperature
+        self.resume_from_checkpoint = resume_from_checkpoint
 
         # --- Sanity Check: Ensure backbone is a PEFT model ---
         if not isinstance(model.backbone, PeftModel):
@@ -170,12 +171,97 @@ class MedusaTrainer:
         tqdm.write(f"[checkpoint] {'Best' if best else f'Epoch {epoch}'} saved to {out_dir}")
 
 
+    # ---------- checkpoint helpers ----------
+    def _find_latest_checkpoint(self):
+        """Finds the latest 'epoch_XXX' checkpoint in self.ckpt_dir."""
+        if not os.path.isdir(self.ckpt_dir):
+            return None
+        
+        # Get all subdirectories that start with 'epoch_'
+        try:
+            epoch_dirs = [
+                d for d in os.listdir(self.ckpt_dir)
+                if os.path.isdir(os.path.join(self.ckpt_dir, d)) and d.startswith("epoch_")
+            ]
+        except OSError:
+            return None
+
+        if not epoch_dirs:
+            return None
+
+        # Sort them (epoch_001, epoch_002, ...) and return the full path to the latest
+        epoch_dirs.sort()
+        latest_epoch_dir = epoch_dirs[-1]
+        return os.path.join(self.ckpt_dir, latest_epoch_dir)
+    
+
+    def _load_checkpoint(self, path):
+        """Loads a checkpoint from the specified directory."""
+        if not os.path.isdir(path):
+            print(f"[warn] Checkpoint path not found, starting from scratch: {path}")
+            return 1 # Start from epoch 1
+
+        try:
+            # 1. Load trainer state
+            state_path = os.path.join(path, "training_state.pt")
+            if not os.path.exists(state_path):
+                 print(f"[warn] training_state.pt not found in {path}, starting from scratch.")
+                 return 1
+                 
+            state = torch.load(state_path, map_location=self.device)
+            # Resume on the *next* epoch after the one that was saved
+            start_epoch = state.get("epoch", 0) + 1 
+            
+            # Load optimizer, scheduler, and scaler states
+            self.optimizer.load_state_dict(state["optimizer_state"])
+            self.scheduler.load_state_dict(state["scheduler_state"])
+            self.scaler.load_state_dict(state["scaler_state"])
+
+            # 2. Load model weights
+            # Load PEFT adapters (this loads into the existing QLoRA model)
+            print(f"[info] Loading adapters from {path}...")
+            self.model.backbone.load_adapter(path, "default")
+            
+            # Load Medusa head
+            head_path = os.path.join(path, "mtp_head.pt")
+            if os.path.exists(head_path):
+                print("[info] Loading MTP head weights...")
+                self.model.mtp_head.load_state_dict(torch.load(head_path, map_location=self.device))
+            else:
+                 print(f"[error] mtp_head.pt not found in {path}. Cannot resume.")
+                 raise FileNotFoundError(f"mtp_head.pt missing from checkpoint: {path}")
+
+            tqdm.write(f"[info] Resuming training from checkpoint: {path} (starting Epoch {start_epoch})")
+            return start_epoch
+
+        except Exception as e:
+            print(f"[error] Failed to load checkpoint from {path}: {e}. Starting from scratch.")
+            # Reset optimizer just in case
+            self.optimizer.zero_grad(set_to_none=True)
+            return 1
+
+
     # ---------- training loop ----------
     def train(self):
         best_val = float("inf")
         global_step = 0
 
-        for epoch in range(1, self.epochs + 1):
+        # --- RESUME LOGIC ---
+        start_epoch = 1
+        latest_checkpoint_path = self._find_latest_checkpoint()
+        
+        if latest_checkpoint_path:
+            tqdm.write(f"[info] Found latest checkpoint: {latest_checkpoint_path}")
+            try:
+                # _load_checkpoint returns the *next* epoch number to start from
+                start_epoch = self._load_checkpoint(latest_checkpoint_path)
+            except Exception as e:
+                print(f"[warn] Failed to load latest checkpoint, starting from scratch. Error: {e}")
+                start_epoch = 1
+        else:
+            tqdm.write("[info] No checkpoint found. Starting from scratch.")
+
+        for epoch in range(start_epoch, self.epochs + 1):
             self.model.train()
             # Ensure Medusa head is trainable even if backbone adapters are frozen
             self.model.mtp_head.train()

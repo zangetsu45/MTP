@@ -1,7 +1,7 @@
 import os, json, argparse, torch
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
-from models.student.gpt2_mtp import GPT2MTPStudent
+from models.student.medusa_llama_student import MedusaLlamaStudent
 
 def load_student(ckpt_dir, model_name="gpt2", device=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -18,7 +18,7 @@ def load_student(ckpt_dir, model_name="gpt2", device=None):
         base_name = model_name
         print(f"[WARN] No metadata found, falling back to model_name={model_name}")
 
-    s = GPT2MTPStudent(model_name=base_name, offsets=offsets, device=device, lora=False)
+    s = MedusaLlamaStudent(model_name=base_name, offsets=offsets, device=device, lora=False)
     print(f"[INFO] Backbone skeleton built: hidden_size={s.config.hidden_size}, vocab={s.config.vocab_size}")
 
     base = AutoModelForCausalLM.from_pretrained(base_name).to(device)

@@ -353,7 +353,7 @@ class MedusaTrainer:
                 self._set_backbone_lr(self.lr_backbone)
                 use_medusa2 = True
 
-            loop = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs} | {stage}", leave=True)
+            loop = tqdm(self.train_loader, total=len(self.train_loader), desc=f"Epoch {epoch} | {stage}", leave=True)
             for step, batch in enumerate(loop, 1):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
@@ -437,35 +437,45 @@ class MedusaTrainer:
 
                 self.scaler.scale(loss).backward()
 
-                # Perform optimizer step only after accumulating gradients
+                # --- START: MODIFIED GRADIENT STEP BLOCK ---
                 if (step + 1) % self.grad_accum == 0 or (step + 1) == len(self.train_loader):
                     # Unscale gradients before clipping
                     self.scaler.unscale_(self.optimizer)
 
                     trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                    perform_step = True # Assume we will step
                     total_norm = float('inf') # Initialize norm
+                    
                     if trainable_params:
                         total_norm = torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
+                        # Check for NaN/Inf gradients after clipping
+                        if torch.isnan(total_norm) or torch.isinf(total_norm):
+                             print(f"[warn] Step {global_step}: Detected NaN/Inf gradient norm ({total_norm}) after unscaling. Skipping optimizer step.")
+                             perform_step = False # Don't step
+                    elif epoch > self.warmup_epochs:
+                        # This is a problem: joint training but no trainable params
+                        print(f"[warn] Step {global_step}: No trainable parameters found during joint training stage. Skipping step.")
+                        perform_step = False
+                    # else:
+                        # This is fine: Stage 1 and no trainable backbone params is expected.
+                        # Head params are separate and should be in trainable_params.
+                        # If trainable_params is empty even in stage 1, something is wrong,
+                        # but perform_step=False is still the right action.
 
-                    # Check for NaN/Inf gradients after clipping
-                    if torch.isnan(total_norm) or torch.isinf(total_norm):
-                         print(f"[warn] Step {global_step}: Detected NaN/Inf gradient norm ({total_norm}) after unscaling. Skipping optimizer step.")
-                         self.optimizer.zero_grad(set_to_none=True) # Clear potentially bad gradients
-                         # Scaler update might still be needed depending on the strategy for NaN grads
-                         # self.scaler.update() # Optionally update scaler even if step is skipped
-                         continue # Skip optimizer step
-                    elif not trainable_params and epoch > self.warmup_epochs:
-                        print(f"[warn] Step {global_step}: No trainable parameters found for gradient clipping during joint training.")
-
-                    # Optimizer step
-                    self.scaler.step(self.optimizer)
-                    # Update scaler
-                    self.scaler.update()
-                    # Scheduler step should happen *after* optimizer step
-                    self.scheduler.step()
-                    # Zero gradients *after* stepping
+                    
+                    # Perform step only if gradients are valid and there are params
+                    if perform_step:
+                        self.scaler.step(self.optimizer)
+                        self.scheduler.step()
+                        global_step += 1
+                    
+                    # ALWAYS update the scaler. This resets its state and prevents the crash.
+                    self.scaler.update() 
+                    
+                    # Always clear grads
                     self.optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
+                # --- END: MODIFIED GRADIENT STEP BLOCK ---
+
 
                 # Log using the unscaled, accumulated loss item
                 running_loss += loss.item() * self.grad_accum
@@ -523,7 +533,7 @@ class MedusaTrainer:
 
             # Calculate loss in fp32 for stability
             loss = F.cross_entropy(
-                shift_logits.float().view(-1, shift_logits.size(-1)), # Cast logits to fp32
+                shift_logits.float().view(-T1, shift_logits.size(-1)), # Cast logits to fp32
                 shift_labels.view(-1),
                 ignore_index=self.pad_id,
                 reduction='sum' # Sum loss over non-ignored tokens

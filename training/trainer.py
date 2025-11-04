@@ -534,7 +534,7 @@ class MedusaTrainer:
 
             # Calculate loss in fp32 for stability
             loss = F.cross_entropy(
-                shift_logits.float().view(-T1, shift_logits.size(-1)), # Cast logits to fp32
+                shift_logits.float().view(-1, shift_logits.size(-1)), # Cast logits to fp32
                 shift_labels.view(-1),
                 ignore_index=self.pad_id,
                 reduction='sum' # Sum loss over non-ignored tokens
